@@ -34,6 +34,14 @@ _OWNER_REPLY_PREFIX = "[owner reply] "
 
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
 
+# LOCAL PATCH (Sky, 2026-09-25, not upstream). The gateway anchors EVERY reply to the id of the
+# inbound message (`gateway/platforms/base.py::_reply_anchor_for_event`), and this adapter forwards
+# that anchor as `replyTo`, so WhatsApp renders each answer as a *quoted reply*. On a personal
+# account that reads like a support-desk bot. Quoting is therefore off unless the owner opts back
+# in with HERMES_WHATSAPP_QUOTE_REPLIES=1. Re-applied idempotently after Hermes updates by
+# ~/.hermes/scripts/whatsapp-no-quote-patch.py (see the whatsapp-linked-device-setup skill).
+_QUOTE_REPLIES = os.getenv("HERMES_WHATSAPP_QUOTE_REPLIES", "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _listener_pids_on_port(port: int) -> list:
     """PIDs *listening* on ``port`` (POSIX), never clients — a bare ``lsof -i :PORT`` once killed the user's browser."""
@@ -638,7 +646,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             last_message_id = None
             for idx, chunk in enumerate(chunks):
                 payload: Dict[str, Any] = {"chatId": chat_id, "message": chunk}
-                if reply_to and idx == 0:
+                if reply_to and idx == 0 and _QUOTE_REPLIES:  # local patch: no quoted replies by default
                     payload["replyTo"] = reply_to  # Reply-to on the first chunk only.
                 result = await self._post_bridge_message("send", payload, timeout=30)
                 if not result.success:

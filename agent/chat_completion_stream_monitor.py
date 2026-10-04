@@ -46,6 +46,13 @@ class StreamingWaitMonitor:
             watchdog = ("stream stale", stale - waiting_secs) if stale is not None and stale != float("inf") else None
             diag = getattr(getattr(self, "clients", None), "diag", None)
             phase = "post_chunk" if isinstance(diag, dict) and diag.get("first_chunk_at") else "first_chunk"
+            try:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "LOCAL DIAG stream silence for %ss (stale_timeout=%s, phase=%s)",
+                    int(waiting_secs), stale, phase)
+            except Exception:
+                pass
             if not self._mon.wait_notice.should_emit(phase, watchdog):
                 self.agent._touch_activity(f"waiting for stream response ({waiting_secs}s, {phase})")
                 return
@@ -64,6 +71,13 @@ class StreamingWaitMonitor:
             wait_notice=wn.WaitNoticeState(),
         )
         _is_local_base = bool(self.agent.base_url) and is_local_endpoint(self.agent.base_url)
+        try:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "LOCAL DIAG stream monitor loop start: stale_timeout=%s",
+                getattr(self, "_stream_stale_timeout", "?"))
+        except Exception:
+            pass
         while not self._call_done.is_set():
             self._call_done.wait(timeout=0.3)
             _hb_now = time.time()

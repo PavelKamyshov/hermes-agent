@@ -10,6 +10,7 @@ conservative: only LONG verbatim repeats (60+ chars) covering a majority of the 
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 
 # Below this length the check doesn't run: short truncations trivially
@@ -148,6 +149,72 @@ def is_runaway_repetition(text: str) -> bool:
     if len(lines) < _MIN_REPEAT_COUNT:
         return True  # no line structure to judge by: a dominated single-line loop
     return len(set(lines)) <= len(lines) * _RUNAWAY_DISTINCT_LINE_RATIO
+
+
+# Fluent (non-verbatim) degeneration, the sibling failure of the repetition loops above: on a very
+# long context a cheap model can drift into associative word salad - every clause parses, nothing
+# repeats, the answer says nothing (2026-10-02: 50,950 chars delivered from a 261k-token session in
+# a single 1145 s API call). The exact-repeat scans are blind to it, so its shape is measured.
+#
+# Calibration lives in the docstring of ~/.hermes/scripts/degenerate-output-patch.py and is
+# re-runnable: ~/.hermes/scripts/degenerate-guard-calibrate.py sweeps the stored corpus and fails if
+# any real answer trips the rule. Measured margins (incident vs worst real answer >=6000 chars):
+# ttr 0.964/0.60, mean word 8.13/5.94, function words 0.011/0.114, newlines per 1k 0.22/6.25,
+# structural chars 0.05%/2.6%. No real answer takes even ONE of the three shape votes.
+DEGENERATE_MIN_CHARS = 6000
+_DEGENERATE_MIN_WORDS = 200
+_DEGENERATE_MIN_TTR = 0.80
+_DEGENERATE_MIN_MEAN_WORD = 6.5
+_DEGENERATE_MAX_FUNCTION_WORD_RATIO = 0.10
+_DEGENERATE_MAX_NL_PER_KILO = 3.0
+_DEGENERATE_MAX_STRUCTURAL_RATIO = 0.01
+_DEGENERATE_MIN_SHAPE_VOTES = 2
+
+# Function words are the language glue a degenerate answer loses (real prose: >=11%; the incident:
+# 1.1%). Explicit lists keep this offline, deterministic and dependency-free; both languages the
+# agent answers in are covered, and a language outside the lists still has the other two votes.
+_DEGENERATE_FUNCTION_WORDS = frozenset(
+    '''
+    і й та але або чи що як коли де куди тому бо щоб якщо вже ще в у на з до за від для про по при
+    над під без між через після перед це цей ця той ті він вона воно вони ми ви я ти не ні так от
+    же би б який яка яке які свій своя своє свої весь вся все всі один два три мене тебе його її їх
+    нам вам їм мені тобі тільки також дуже можна треба є був була було були буде будуть має маю
+    маєш робити зробити дати взяти такий така таке такі тут там тоді зараз тепер потім
+    the a an and or but if when where why how that this these those is are was were be been being to
+    of in on at for with from by about into over after before not no yes it its we you they he she
+    his her their our your my me them us can could should would will may might must have has had do
+    does did there then than so such just also very more most other some any all each both
+    '''.split()
+)
+# Code and data carry these; word salad cannot (the incident had 0.05%, every real answer >=2.6%).
+_DEGENERATE_STRUCTURAL_CHARS = frozenset("{}[]()=:;<>|/\\`~@#$%^&*_+")
+
+
+def is_incoherent_degeneration(text: str) -> bool:
+    '''True when a completed answer has the word-salad shape: no line structure, no code shape, and
+    at least two of three prose-degeneration votes - almost no word reuse, abnormally long words,
+    almost no function words.'''
+    if not isinstance(text, str) or len(text) < DEGENERATE_MIN_CHARS:
+        return False
+    words = re.findall(r"[0-9A-Za-z\u0400-\u04ff'\u2019-]+", text.lower())
+    n = len(words)
+    if n < _DEGENERATE_MIN_WORDS:
+        return False
+    # Line structure and code shape first: real answers, tables and code all have them, so nothing
+    # carrying structure is ever judged on word statistics.
+    if text.count("\n") * 1000.0 / len(text) >= _DEGENERATE_MAX_NL_PER_KILO:
+        return False
+    structural = sum(1 for ch in text if ch in _DEGENERATE_STRUCTURAL_CHARS) / len(text)
+    if structural >= _DEGENERATE_MAX_STRUCTURAL_RATIO:
+        return False
+    votes = 0
+    if len(set(words)) / n > _DEGENERATE_MIN_TTR:
+        votes += 1
+    if sum(len(w) for w in words) / n > _DEGENERATE_MIN_MEAN_WORD:
+        votes += 1
+    if sum(1 for w in words if w in _DEGENERATE_FUNCTION_WORDS) / n < _DEGENERATE_MAX_FUNCTION_WORD_RATIO:
+        votes += 1
+    return votes >= _DEGENERATE_MIN_SHAPE_VOTES
 
 
 def _line_repetition_dominated(text: str, n: int) -> bool:

@@ -89,6 +89,20 @@ def _unexpected_silence_reply() -> str:
     return t("gateway.errors.unexpected_silence")
 
 
+# LOCAL PATCH (Sky): platforms where the agent impersonates the owner. There a marker-silence is
+# the CORRECT answer to an acknowledgement or a reaction (the contact must see nothing), and no
+# internal notice may be posted into the chat - both would expose the agent. Override the set with
+# HERMES_QUIET_PLATFORMS="whatsapp,foo" (comma-separated).
+_LOCAL_QUIET_PLATFORMS = frozenset(
+    p.strip().lower() for p in os.getenv("HERMES_QUIET_PLATFORMS", "whatsapp").split(",") if p.strip()
+)
+
+
+def _local_quiet_platform(name) -> bool:
+    """True for a platform whose chats may never receive machinery text (owner impersonation)."""
+    return str(name or "").rsplit(".", 1)[-1].strip().lower() in _LOCAL_QUIET_PLATFORMS
+
+
 def _bg_prompt_preview(prompt: str, limit: int = 60) -> str:
     """Short single-line quote of a /bg prompt for its failure notice (the task id means nothing to the user)."""
     text = " ".join(str(prompt or "").split())
@@ -1521,12 +1535,18 @@ class GatewayTurnMixin:
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
         if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
-            logger.warning(
-                "silence marker rejected on a user turn: platform=%s chat=%s",
-                _platform_name, source.chat_id or "unknown",
-            )
-            _intentional_silence = False
-            response = _unexpected_silence_reply()
+            if _local_quiet_platform(_platform_name):   # LOCAL PATCH: silence is correct here
+                logger.info(
+                    "silence marker honoured on a quiet platform: platform=%s chat=%s",
+                    _platform_name, source.chat_id or "unknown",
+                )
+            else:
+                logger.warning(
+                    "silence marker rejected on a user turn: platform=%s chat=%s",
+                    _platform_name, source.chat_id or "unknown",
+                )
+                _intentional_silence = False
+                response = _unexpected_silence_reply()
         elif _intentional_silence and not is_machinery_display_kind(_silence_kind):
             logger.debug(
                 "silence marker suppressed on an unaddressed turn: platform=%s chat=%s",
@@ -1536,7 +1556,9 @@ class GatewayTurnMixin:
         # "(empty)" = the model produced no visible content after exhausting all retries. One
         # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user
         # reads the same words on every surface.
-        if response == "(empty)" and not _intentional_silence:
+        if response == "(empty)" and not _intentional_silence and not _local_quiet_platform(
+            _platform_name
+        ):   # LOCAL PATCH: an empty turn on a quiet platform stays empty - no explainer text
             from agent.turn_explainers import EMPTY_RESPONSE_EXPLANATION
 
             _model = str(agent_result.get("model") or "").strip() or t("gateway.errors.empty_response_model_label")
@@ -2237,7 +2259,15 @@ class GatewayTurnMixin:
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
             if agent_failed_early and not is_context_overflow_failure:
-                response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
+                if _local_quiet_platform(getattr(source, "platform", None)):
+                    # LOCAL PATCH: the retry-guidance notice is machinery text; a third party
+                    # must never read it. Any model text of its own is still delivered.
+                    logger.info(
+                        "failed-turn notice withheld on a quiet platform: platform=%s chat=%s",
+                        getattr(source, "platform", None), getattr(source, "chat_id", "unknown"),
+                    )
+                else:
+                    response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
@@ -3705,7 +3735,9 @@ class GatewayTurnMixin:
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected) or _local_quiet_platform(
+                getattr(getattr(turn_ctx, "source", None), "platform", None)
+            ):   # LOCAL PATCH: silence is correct on a quiet platform
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",

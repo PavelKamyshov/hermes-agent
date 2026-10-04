@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.error_classifier import FailoverReason
 from agent.message_metadata import append_message
 from agent.message_sanitization import close_interrupted_tool_sequence
-from agent.repetition_guard import is_repetition_dominated
+from agent.repetition_guard import is_incoherent_degeneration, is_repetition_dominated
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import content_policy_copy, provider_label_for, site_copy, stamp_failure
 from agent.turn_retry_state import TurnRetryState
@@ -118,6 +118,19 @@ _REPETITION_DOMINATED = repetition_copy(
     "instead of continuing a degenerate response",
     "so continuing would only produce more repeated text. The partial response was discarded.",
     " and was truncated mid-loop; refusing to continue a",
+)
+# Fluent degeneration needs its own copy: it repeats nothing, so "repetition loop" would misdescribe
+# it. Same reasoning as the stop path - a rotten context reproduces the failure, so do not continue.
+_DEGENERATE_DOMINATED = (
+    "\U0001f9e0 Response discarded - degenerate (incoherent) output detected.",
+    "\u26a0\ufe0f **Response Discarded - Degenerate Text**\n\nThe model broke down into incoherent "
+    "text instead of an answer, and this response had already used its whole output budget, so "
+    "continuing it would only produce more of the same.\n\n"
+    "\u2192 The usual cause is a very long session context - start a fresh session with `/new`\n"
+    "\u2192 Or switch model with `/model`\n"
+    "\u2192 Then resend your message (the conversation history is preserved)",
+    "Model output degenerated into incoherent text and was truncated mid-response; refusing to "
+    "continue a degenerate response.",
 )
 _CEILING_NO_TEXT = (
     "⚠️ **No visible answer was produced.** The model hit its output-token limit on every "
@@ -254,6 +267,8 @@ def _abort_reason(agent: Any, content: Any, has_tool_calls: bool) -> Optional[tu
     visible = agent._strip_think_blocks(content) if isinstance(content, str) else content
     if visible and is_repetition_dominated(visible):
         return _REPETITION_DOMINATED
+    if visible and is_incoherent_degeneration(visible):
+        return _DEGENERATE_DOMINATED
     return None
 
 

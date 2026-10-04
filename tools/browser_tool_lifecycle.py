@@ -171,6 +171,13 @@ def _cleanup_inactive_browser_sessions():
             with _session_owner_scope(task_id):
                 cleanup_browser(task_id)
             _forget_session_tracking(task_id)
+            # LOCAL PATCH (Sky, 2026-09-27, not upstream): the real-profile Chrome we launched
+            # outlives its session by design and blocks the user's own Chrome while it runs.
+            try:
+                from tools import browser_tool_real_profile as _rp
+                _rp._release_idle_real_profile_chrome()
+            except Exception as _rp_exc:  # never let this break session cleanup
+                _bt.logger.debug("real-profile idle release skipped: %s", _rp_exc)
         except Exception as e:
             with _bt._cleanup_lock:
                 failures = _bt._cleanup_failures[task_id] = _bt._cleanup_failures.get(task_id, 0) + 1

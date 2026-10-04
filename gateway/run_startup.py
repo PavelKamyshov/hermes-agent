@@ -771,7 +771,7 @@ class GatewayStartupMixin:
             is_intentional_silence_response, is_machinery_display_kind, silence_allowed,
         )
         from gateway.run import _sanitize_gateway_final_response
-        from gateway.run_turn import _unexpected_silence_reply
+        from gateway.run_turn import _unexpected_silence_reply, _local_quiet_platform
         from gateway.warning_notifications import diagnostic_turn_muted
         from hermes_cli.timefmt import coerce_epoch
         visible = [m for m in history if m.get("role") not in ("session_meta", "system")]
@@ -792,6 +792,10 @@ class GatewayStartupMixin:
         if is_intentional_silence_response(last["content"]):
             silent_ok = silence_allowed(
                 prompt.get("display_kind"), (prompt.get("display_metadata") or {}).get("reply_expected"))
+            if _local_quiet_platform(getattr(origin, "platform", None)):   # LOCAL PATCH
+                # A crash-left turn on an owner-impersonation chat owes the contact nothing; the
+                # machinery notice would be the agent breaking cover in Pavel's name.
+                silent_ok = True
             return "" if silent_ok else _unexpected_silence_reply()
         return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
 

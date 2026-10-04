@@ -12,7 +12,8 @@ import logging
 from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
-from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
+from agent.repetition_guard import (STOP_PATH_MIN_CHARS, is_incoherent_degeneration,
+                                    is_runaway_repetition)
 from agent.turn_failure_copy import stamp_failure
 from agent.turn_empty_response import recover_empty_response
 from agent.turn_stop_gates import apply_stop_gates
@@ -22,6 +23,18 @@ _REPETITION_STOPPED = repetition_copy(
     "before delivery",
     "so the repeated output was discarded.",
     "; refusing to return a",
+)
+
+# Sibling of _REPETITION_STOPPED for fluent degeneration (see agent/repetition_guard.py): the text
+# repeats nothing and reads as prose, so the repetition copy would misdescribe it.
+_DEGENERATE_STOPPED = (
+    "\U0001f9e0 Response discarded - degenerate (incoherent) output detected.",
+    "\u26a0\ufe0f **Response Discarded - Degenerate Text**\n\nThis reply broke down into incoherent "
+    "text instead of an answer, so it was not delivered.\n\n"
+    "\u2192 The usual cause is a very long session context - start a fresh session with `/new`\n"
+    "\u2192 Or switch model with `/model`\n"
+    "\u2192 Then resend your message (the conversation history is preserved)",
+    "Model output degenerated into incoherent text; the degenerate response was discarded.",
 )
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -264,6 +277,22 @@ def finish_text_response(
     ):
         line, user_response, error = _REPETITION_STOPPED
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
+        agent._cleanup_task_resources(effective_task_id)
+        agent._persist_session(messages, conversation_history)
+        return _verdict("return", stamp_failure(
+            partial_result(messages, api_call_count, user_response, error), "truncated", True,
+        ))
+
+    # Fluent degeneration (word salad) ends the turn normally with finish_reason="stop" and repeats
+    # nothing, so the check above never fires on it. Discard it the same way rather than deliver
+    # nonsense to the user's chat (agent/repetition_guard.py documents the calibrated shape).
+    if final_response and is_incoherent_degeneration(final_response):
+        line, user_response, error = _DEGENERATE_STOPPED
+        agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
+        logger.warning(
+            "Degenerate final: %d-char response discarded (word-salad shape, model=%s provider=%s)",
+            len(final_response), agent.model, agent.provider,
+        )
         agent._cleanup_task_resources(effective_task_id)
         agent._persist_session(messages, conversation_history)
         return _verdict("return", stamp_failure(

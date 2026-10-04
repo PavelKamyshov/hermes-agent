@@ -71,6 +71,22 @@ def _get_smart_policy() -> str:
     return policy.strip() if isinstance(policy, str) else ""
 
 
+def _smart_budget() -> int:
+    """Answer budget for the guardian: room to think, then exactly one word.
+
+    A reasoning model needs tokens for its hidden thinking BEFORE it can emit the verdict,
+    so a tiny budget yields an empty body and escalates everything to the owner. Read from
+    ``approvals.smart_max_tokens`` so the number can be tuned without touching code.
+    """
+    try:
+        budget = int(_ctx._get_approval_config().get("smart_max_tokens"))
+        if budget > 0:
+            return budget
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return 2048
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Ask the auxiliary LLM; return 'approve', 'deny', or 'escalate' (uncertain/failed).
 
@@ -107,21 +123,39 @@ def _smart_approve(command: str, description: str) -> str:
             "Respond with exactly one word: APPROVE, DENY, or ESCALATE"
         )
         response = call_llm(
-            task="approval", temperature=0, max_tokens=16, timeout=smart_timeout,
+            task="approval", temperature=0, max_tokens=_smart_budget(), timeout=smart_timeout,
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
         )
         logger.debug("Smart approvals: LLM call completed in %.1fs", time.monotonic() - _smart_t0)
         answer = (response.choices[0].message.content or "").strip().upper()
         if not answer:
-            # WARNING, not DEBUG: an empty-but-200 body is an infrastructure failure, not a
-            # verdict — typically finish_reason=="length" after a reasoning model spent the
-            # whole max_tokens budget on hidden reasoning (#117428). It escalates like any
-            # uncertain outcome, but is indistinguishable from a genuine ESCALATE in the logs
-            # unless this fires above DEBUG.
+            # LOCAL PATCH (Sky, 2026-09-30, not upstream). WARNING, not DEBUG: an empty-but-200
+            # body is an infrastructure failure, not a verdict — typically finish_reason=="length"
+            # after a reasoning model spent the whole max_tokens budget on hidden reasoning
+            # (#117428). Upstream escalates straight away, which turns a transient provider hiccup
+            # into an approval prompt on the owner's phone. Retry once with room to think first;
+            # fail-closed still applies when both attempts come back empty.
             finish_reason = getattr(response.choices[0], "finish_reason", None)
+            retry_budget = max(_smart_budget() * 4, 4096)
             logger.warning("Smart approvals: guardian returned an empty answer "
-                           "(finish_reason=%s), escalating", finish_reason)
-            return "escalate"
+                           "(finish_reason=%s), retrying with max_tokens=%d",
+                           finish_reason, retry_budget)
+            try:
+                response = call_llm(
+                    task="approval", temperature=0, max_tokens=retry_budget, timeout=smart_timeout,
+                    messages=[{"role": "system", "content": system_prompt},
+                              {"role": "user", "content": user_prompt}],
+                )
+            except Exception as e:
+                logger.warning("Smart approvals: guardian retry failed after %.1fs (%s: %s), escalating",
+                               time.monotonic() - _smart_t0, type(e).__name__, e)
+                return "escalate"
+            answer = (response.choices[0].message.content or "").strip().upper()
+            if not answer:
+                logger.warning("Smart approvals: guardian returned an empty answer twice "
+                               "(finish_reason=%s), escalating",
+                               getattr(response.choices[0], "finish_reason", None))
+                return "escalate"
         return _VERDICTS.get(answer, "escalate")
     except Exception as e:
         # WARNING, not DEBUG: a failed/blocked guardian call is a real event

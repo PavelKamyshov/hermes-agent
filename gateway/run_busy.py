@@ -885,6 +885,12 @@ class GatewayBusySessionMixin:
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
+        # LOCAL PATCH: machinery acks never go into an owner-impersonation chat.
+        from gateway.run_turn import _local_quiet_platform
+        if _local_quiet_platform(getattr(getattr(event, "source", None), "platform", None)):
+            logger.debug("Busy ack suppressed on a quiet platform for session %s", session_key)
+            return True
+
         # Debounce (30s) before the config-heavy display lookup.
         now = time.time()
         if now - (_busy_state.turn.busy_ack_ts if _busy_state else 0) < 30:

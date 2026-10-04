@@ -1023,6 +1023,8 @@ class GatewayNotificationsMixin:
                 notified_chats.add(chat)
                 delivered.add(target)
                 logger.info("Sent home-channel startup notification to %s:%s", platform.value, home.chat_id)
+                # GUARD (local patch: gateway-exit75-guard): record timestamp for throttle
+                self._last_restart_notification_ts = time.monotonic()
         return delivered
 
     async def _send_session_db_warning_notifications(self) -> None:

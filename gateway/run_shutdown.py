@@ -1082,6 +1082,15 @@ class GatewayShutdownMixin:
                 presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key)
             if not presented:
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
+        # GUARD (local patch: gateway-exit75-guard): throttle restart notifications (5 min)
+        _now = time.monotonic()
+        _last = getattr(self, '_last_restart_notification_ts', 0.0)
+        if _last > 0 and (_now - _last) < 300:
+            logger.info(
+                "Suppressed home-channel shutdown notification: last was %.0fs ago "
+                "(throttle: 300s)", _now - _last
+            )
+            return
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
             return
@@ -2134,8 +2143,18 @@ class GatewayShutdownMixin:
                 )
         if self._restart_requested and self._restart_via_service:
             # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.
-            self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
-            self._exit_reason = self._exit_reason or "Gateway restart requested"
+            # GUARD (local patch: gateway-exit75-guard): only fire on explicit admin restarts
+            # (SIGUSR1, hermes gateway restart, pause-for-update), NOT on adapter-failure stops.
+            # Adapter failures call stop() without restart=True and must not exit 75.
+            if getattr(self, '_exit75_allowed', True):
+                self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
+                self._exit_reason = self._exit_reason or "Gateway restart requested"
+            else:
+                logger.info(
+                    "Suppressed exit 75: restart was not explicitly admin-requested "
+                    "(adapter failure or internal trigger). Exiting cleanly for service "
+                    "manager relaunch."
+                )
         self._draining = False
         # Terminal gateway_state: "stopped", or "running" on an UNEXPECTED signal (docker restart,
         # OOM) — container_boot.py only auto-starts gateways last seen "running".

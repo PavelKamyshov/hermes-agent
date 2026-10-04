@@ -24,7 +24,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync, statSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -122,7 +122,35 @@ const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const WHATSAPP_GROUP_POLICY = String(process.env.WHATSAPP_GROUP_POLICY || 'pairing').trim().toLowerCase();
-const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+const BASE_ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+// LOCAL PATCH (Sky): live contact list. The Python side re-reads its scoped env per message
+// (whatsapp_common._live_dm_allow_from), but this bridge snapshots the allowlist at startup, so a
+// new counterparty needed a full gateway restart. Re-read the same key from .env when the file
+// changes; a missing or unreadable file keeps the startup list (never widen access on error).
+const LIVE_ALLOWLIST_ENV_FILE = process.env.HERMES_LIVE_ALLOWLIST_ENV_FILE
+  || path.join(process.env.HERMES_HOME || path.join(process.env.HOME || '~', '.hermes'), '.env');
+let ALLOWED_USERS = new Set(BASE_ALLOWED_USERS);
+let _allowedUsersMtime = 0;
+function refreshAllowedUsers() {
+  try {
+    if (!existsSync(LIVE_ALLOWLIST_ENV_FILE)) return ALLOWED_USERS;
+    const mtime = statSync(LIVE_ALLOWLIST_ENV_FILE).mtimeMs;
+    if (mtime === _allowedUsersMtime) return ALLOWED_USERS;
+    const raw = readFileSync(LIVE_ALLOWLIST_ENV_FILE, 'utf8');
+    _allowedUsersMtime = mtime;
+    const line = raw.split('\n').find((l) => l.trim().startsWith('WHATSAPP_ALLOWED_USERS='));
+    if (!line) return ALLOWED_USERS;
+    const live = parseAllowedUsers(line.slice(line.indexOf('=') + 1).trim().replace(/^["']|["']$/g, ''));
+    const merged = new Set([...BASE_ALLOWED_USERS, ...live]);
+    if (merged.size !== ALLOWED_USERS.size) {
+      ALLOWED_USERS = merged;
+      console.log(`\u{1F513} Allowlist reloaded: ${merged.size} numbers`);
+    }
+    return ALLOWED_USERS;
+  } catch (err) {
+    return ALLOWED_USERS;
+  }
+}
 // Group authorization is by group JID, not by every participant's JID.  The
 // Python adapter still applies group policy and mention rules after intake.
 const GROUP_ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_GROUP_ALLOWED_USERS || '');
@@ -580,7 +608,7 @@ async function startSocket() {
             fromMe: true,
             fromOwnerEnabled: FORWARD_OWNER_MESSAGES,
             recentlySent: recentlySentIds,
-            allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
+            allowlistMatches: (id) => matchesAllowedUser(id, refreshAllowedUsers(), SESSION_DIR),
             messageId: msg.key.id,
             chatId,
           });
@@ -651,7 +679,7 @@ async function startSocket() {
               sessionDir: SESSION_DIR,
             })
           : WHATSAPP_DM_POLICY === 'pairing'
-            || matchesAllowedSender(senderId, senderAltId, ALLOWED_USERS, SESSION_DIR);
+            || matchesAllowedSender(senderId, senderAltId, refreshAllowedUsers(), SESSION_DIR);
         if (!intakeAllowed) {
           try {
             writeJsonLine({
