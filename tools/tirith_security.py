@@ -64,7 +64,7 @@ _circuit_open_at: float = 0.0
 _breaker_lock = threading.Lock()
 
 # Warn-once: spawn/path warnings sit in the hot path and would otherwise repeat once per
-# terminal command while tirith is unavailable (e.g. install thread still running).
+# terminal command while tirith is unavailable.
 _warned_messages: set[str] = set()
 _warned_lock = threading.Lock()
 
@@ -144,6 +144,11 @@ def _claim_install_attempt() -> bool:
         return True
 
 
+def _install_in_flight() -> threading.Thread | None:
+    thread = _install_threads.get(hermes_home_key())
+    return thread if thread is not None and thread.is_alive() else None
+
+
 def is_platform_supported() -> bool:
     """Whether PM has a managed Tirith build for this host."""
     import pm
@@ -174,15 +179,8 @@ def _resolve_tirith_path(configured_path: str) -> str:
     if configured_path == "tirith":
         import pm
 
-        if not pm.lazy_installs_allowed() or not _claim_install_attempt():
-            return os.path.expanduser(configured_path)
-        try:
-            pm.ensure("tirith")
-            selected = pm.installed_package("tirith")
-            if selected and selected.binary:
-                return str(selected.binary)
-        except Exception as exc:
-            _warn_once("tirith_install", "tirith install unavailable: %s", exc)
+        if pm.lazy_installs_allowed():
+            _start_background_install(log_failures=True)
     return os.path.expanduser(configured_path)
 
 
@@ -194,6 +192,17 @@ def _background_install(*, log_failures: bool) -> None:
     except Exception as exc:
         log = logger.warning if log_failures else logger.debug
         log("tirith install failed: %s", exc)
+
+
+def _start_background_install(*, log_failures: bool) -> None:
+    if _claim_install_attempt():
+        context = copy_context()
+        thread = threading.Thread(
+            target=context.run, args=(_background_install,),
+            kwargs={"log_failures": log_failures}, daemon=True,
+        )
+        _install_threads[hermes_home_key()] = thread
+        thread.start()
 
 
 def ensure_installed(*, log_failures: bool = True, explicit: bool = False):
@@ -218,14 +227,7 @@ def ensure_installed(*, log_failures: bool = True, explicit: bool = False):
         return found
     if not is_platform_supported() or not pm.lazy_installs_allowed():
         return None
-    if _claim_install_attempt():
-        context = copy_context()
-        thread = threading.Thread(
-            target=context.run, args=(_background_install,),
-            kwargs={"log_failures": log_failures}, daemon=True,
-        )
-        _install_threads[hermes_home_key()] = thread
-        thread.start()
+    _start_background_install(log_failures=log_failures)
     return None
 
 
@@ -241,8 +243,7 @@ def missing_is_expected() -> bool:
     configured = _load_security_config()["tirith_path"]
     if configured != "tirith":
         return False
-    thread = _install_threads.get(hermes_home_key())
-    if thread is not None and thread.is_alive():
+    if _install_in_flight():
         return True
     return _local_tirith(configured) is not None or not pm.lazy_installs_allowed()
 
@@ -310,6 +311,11 @@ def check_command_security(command: str) -> dict:
     if tirith_path is None:
         _warn_once("tirith_path_none", "tirith path resolved to None; scanning disabled")
         return _fail(fail_open, "tirith path unavailable", "tirith path unavailable (fail-closed)")
+    if tirith_path == "tirith" and (install := _install_in_flight()):
+        if fail_open:
+            return _verdict("allow", "tirith installing")
+        install.join()
+        tirith_path = _resolve_tirith_path(cfg["tirith_path"])
     try:
         result = subprocess.run(
             [tirith_path, "check", "--json", "--non-interactive", "--shell", "posix", "--", command],
@@ -356,109 +362,8 @@ def check_command_security(command: str) -> dict:
     if action == "warn" and findings and all(_is_emoji_variation_selector_finding(f) for f in findings) \
             and _has_only_emoji_presentation_selectors(command):
         return _verdict("allow")
-    # LOCAL PATCH (Sky, 2026-09-30, not upstream). confusable_text in predominantly non-Latin
-    # tokens is foreign-language prose, not a masquerade. Narrow by design: one lookalike
-    # substituted into an ASCII token leaves it ASCII-dominant and keeps its block. Logged, so
-    # the exception is auditable instead of silent. Owner-approved 2026-09-30.
-    if action == "block" and findings and all(_is_confusable_text_finding(f) for f in findings):
-        confusables = _confusable_codepoints(findings)
-        if _confusables_are_latin_prose(confusables) or _confusables_only_in_nonlatin_words(
-                command, confusables):
-            logger.info("tirith confusable_text downgraded to allow: %d lookalike code point(s) "
-                        "appear only in non-Latin tokens", len(confusables))
-            return _verdict("allow", summary)
     return _verdict(action, summary, findings)
 
-
-def _is_confusable_text_finding(finding: dict) -> bool:
-    """True only for the Tirith rule that reports ASCII-lookalike Unicode characters."""
-    return isinstance(finding, dict) and finding.get("rule_id") == "confusable_text"
-
-
-def _confusables_are_latin_prose(confusables: set) -> bool:
-    """True when every lookalike is a LATIN-script letter (i, c, s with a diacritic).
-
-    Turkish, Romanian, German and French write said letters constantly; dotless i (U+0131) is the
-    one Tirith's table calls near-identical to ASCII, so a Turkish search term reads as a homoglyph
-    attack. Cross-SCRIPT lookalikes (Cyrillic, Greek, fullwidth, math alphanumerics) are NOT LATIN
-    by Unicode name and keep their block, which is where the real masquerade risk lives.
-    """
-    if not confusables:
-        return False
-    import unicodedata
-    return all(unicodedata.name(ch, "").startswith("LATIN") for ch in confusables)
-
-
-def _confusable_codepoints(findings: list) -> set:
-    """The code points Tirith itself named as confusable, read back from its finding evidence."""
-    out: set = set()
-    for finding in findings:
-        if not isinstance(finding, dict):
-            continue
-        for item in finding.get("evidence") or []:
-            if not isinstance(item, dict) or item.get("type") != "byte_sequence":
-                continue
-            raw = str(item.get("hex") or "").strip()
-            if not raw.upper().startswith("U+"):
-                continue
-            try:
-                out.add(chr(int(raw[2:], 16)))
-            except ValueError:
-                continue
-    return out
-
-
-def _confusables_only_in_nonlatin_words(command: str, confusables: set) -> bool:
-    """True when every alphanumeric run carrying a lookalike is script-majority non-Latin.
-
-    ``сurl`` (Cyrillic c) is ASCII-dominant, so the masquerade keeps its block; ``Украïнцi``
-    (Latin i inside a Ukrainian word) is not, so prose is allowed. Judged per WORD rather than
-    per whitespace token, because Ukrainian words sit glued to timestamps and date lists
-    (``Аланії:3,10,17,24,31.10``) where a whole-token ratio loses. Token-scoped on purpose: a
-    command-wide ratio would let any long Ukrainian argument buy an attacker a bypass.
-    """
-    if not confusables:
-        return False
-    seen = False
-    for word in _alnum_runs(command):
-        lookalikes = sum(1 for ch in word if ch in confusables)
-        if not lookalikes:
-            continue
-        seen = True
-        ascii_alnum = sum(1 for ch in word if ch.isascii() and ch.isalnum())
-        if lookalikes <= ascii_alnum:
-            return False
-    return seen
-
-
-def _alnum_runs(text: str):
-    """
-    Maximal runs of alphanumeric characters - punctuation, quotes and emoji separate words.
-
-    A backslash before an ASCII character is a string escape (n, t, a quote): the escaped
-    character is dropped rather than glued to the next word, which is what made a quoted
-    bus-route line read as the word 'n' glued to the city name. A backslash before a
-    NON-ASCII character keeps the strict path instead - the foreign letter still starts
-    its own word and is judged, so a substituted command name cannot hide behind one.
-    """
-    run: list = []
-    i, length = 0, len(text)
-    while i < length:
-        ch = text[i]
-        if ord(ch) == 92 and i + 1 < length and text[i + 1].isascii():
-            if run:
-                yield "".join(run)
-                run = []
-            i += 2
-            continue
-        if ch.isalnum():
-            run.append(ch)
-        elif run:
-            yield "".join(run)
-            run = []
-        i += 1
-    if run:
-        yield "".join(run)
 
 def _is_app_tld_finding(finding: dict) -> bool:
     """True if this finding is a lookalike_tld warning for the .app TLD only."""

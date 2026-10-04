@@ -1866,6 +1866,9 @@ def cmd_chat(args):
         os.environ["HERMES_SESSION_SOURCE_EXPLICIT"] = "1"
 
     _pin_kanban_board_env()
+    from hermes_cli.observability.shared_metrics_consent import offer_consent_before_chat
+
+    offer_consent_before_chat(args)
     _confirm_startup_expensive_model_override(args)
 
     passthrough = {k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH}
@@ -2487,6 +2490,10 @@ from hermes_cli.update_receipt import update_receipt_scope
 @update_receipt_scope()
 def cmd_update(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
+    # Marks this frame as the CURRENT updater for
+    # _old_updater.in_historical_update(); historical on-disk updaters do not
+    # declare this local, so only they hand off through retired shims.
+    _hermes_current_updater_frame = True
     from hermes_cli.update_owning_install import retarget_to_owning_install
 
     retarget_to_owning_install(PROJECT_ROOT)

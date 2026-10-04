@@ -119,13 +119,21 @@ _REPETITION_DOMINATED = repetition_copy(
     "so continuing would only produce more repeated text. The partial response was discarded.",
     " and was truncated mid-loop; refusing to continue a",
 )
-# Fluent degeneration needs its own copy: it repeats nothing, so "repetition loop" would misdescribe
-# it. Same reasoning as the stop path - a rotten context reproduces the failure, so do not continue.
+_REPETITION_STREAM_CUT = repetition_copy(
+    "the stream mid-loop",
+    "so the stream was stopped instead of running on. The partial response was discarded.",
+    " and the stream was cut mid-loop; discarding the",
+)
+# Fluent degeneration is a sibling of the repetition aborts, not a member of them: the exact-repeat
+# scans never fire because nothing repeats verbatim - a cheap model on a rotten context drifts into
+# grammatical, unrepeated, meaningless word salad instead. Same stop reasoning as the other variants
+# (continuing reproduces the failure), so it keeps its own copy rather than reusing repetition_copy's
+# "repetition loop" wording, which would misdescribe what happened.
 _DEGENERATE_DOMINATED = (
     "\U0001f9e0 Response discarded - degenerate (incoherent) output detected.",
     "\u26a0\ufe0f **Response Discarded - Degenerate Text**\n\nThe model broke down into incoherent "
-    "text instead of an answer, and this response had already used its whole output budget, so "
-    "continuing it would only produce more of the same.\n\n"
+    "text instead of an answer, and it was truncated mid-response, so continuing it would only "
+    "produce more of the same.\n\n"
     "\u2192 The usual cause is a very long session context - start a fresh session with `/new`\n"
     "\u2192 Or switch model with `/model`\n"
     "\u2192 Then resend your message (the conversation history is preserved)",
@@ -475,6 +483,12 @@ def recover_from_truncation(
         truncated_tool_call_retries=truncated_tool_call_retries, retry_count=retry_count,
         compression_attempts=compression_attempts,
     )
+    if getattr(response, "_runaway_repetition", False):
+        # The streaming call cut a live repetition loop: a continuation would only re-enter it,
+        # whatever the partial or its tool calls look like.
+        line, user_response, error = _REPETITION_STREAM_CUT
+        agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
+        return st.end_turn(user_response, error)
     st.window_filled = _prompt_filled_window(agent, response)
     if st.is_stub and getattr(response, "_clean_eof", False):
         _banner = ("Response truncated — server ended the stream without ever sending finish_reason "
