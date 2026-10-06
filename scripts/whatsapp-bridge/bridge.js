@@ -1152,6 +1152,62 @@ app.get('/chat/:id', async (req, res) => {
   });
 });
 
+// Join a group from an invite link or bare code.
+// LOCAL PATCH (Sky, 2026-10-05, not upstream). Baileys has always exposed groupAcceptInvite, but
+// nothing on the bridge called it, so the account could be handed an invite link and still have no
+// way to accept it. Pavel's rule is that the agent handles its own way in. Accepts the full URL or
+// the bare code, with or without the ?mode=gi_t query and the angle brackets WhatsApp wraps around
+// a copied code. Re-applied idempotently after Hermes updates by
+// ~/.hermes/scripts/whatsapp-group-join-patch.py.
+app.post('/group/join', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const raw = String(req.body?.invite || req.body?.link || req.body?.code || '').trim();
+  if (!raw) {
+    return res.status(400).json({ error: 'invite (link or code) is required' });
+  }
+  const code = raw
+    .replace(/^<?https?:\/\/chat\.whatsapp\.com\//i, '')
+    .replace(/[?#].*$/, '')
+    .replace(/^</, '')
+    .replace(/>$/, '')
+    .trim();
+  if (!code) {
+    return res.status(400).json({ error: 'no invite code found in that value' });
+  }
+  try {
+    const groupJid = await sock.groupAcceptInvite(code);
+    if (!groupJid) {
+      return res.status(502).json({ error: 'WhatsApp returned no group for that invite' });
+    }
+    let name = '';
+    try {
+      name = (await sock.groupMetadata(groupJid))?.subject || '';
+    } catch (e) {}
+    return res.json({ success: true, chatId: groupJid, name });
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+// Groups this account is currently in - the only way to confirm a join from outside the app.
+app.get('/groups', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const all = await sock.groupFetchAllParticipating();
+    return res.json(Object.values(all || {}).map((g) => ({
+      chatId: g.id,
+      name: g.subject,
+      size: (g.participants || []).length,
+    })));
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({
